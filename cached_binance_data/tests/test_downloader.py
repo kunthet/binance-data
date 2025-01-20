@@ -2,11 +2,11 @@ import pytest
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-from binance_data import BinanceDataDownloader
+from cached_binance_data import BinanceDataDownloader
 from unittest.mock import Mock, patch
 import os
 import shutil
-from binance_data.downloader import TimeFrame
+from cached_binance_data.downloader import TimeFrame
 import requests
 
 @pytest.fixture

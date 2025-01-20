@@ -1,4 +1,4 @@
-from binance_data import BinanceDataDownloader
+from cached_binance_data import BinanceDataDownloader
 from datetime import datetime, timedelta
 
 def main():

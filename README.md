@@ -1,4 +1,4 @@
-# Binance Futures Data Downloader
+# Cached Binance Futures Data Downloader
 
 A Python module for downloading Binance futures market data with efficient caching support.
 
@@ -13,13 +13,13 @@ A Python module for downloading Binance futures market data with efficient cachi
 ## Installation
 
 ```bash
-pip install binance-data
+pip install cached-binance-data
 ```
 
 ## Quick Start
 
 ```python
-from binance_data import BinanceDataDownloader
+from cached_binance_data import BinanceDataDownloader
 
 # Initialize downloader
 downloader = BinanceDataDownloader()
@@ -40,8 +40,8 @@ print(data.head())
 
 Data is cached in the `hlocv_cache` folder with the following format:
 ```
-SYMBOL_TIMEFRAME_STARTDATE_STARTTIME_ENDDATE_ENDTIME.npy
-Example: XRPUSDT_1M_20240101_000000_20240131_235959.npy
+SYMBOL_TIMEFRAME_STARTDATE_ENDDATE.npy
+Example: XRPUSDT_1M_20240101_20240131.npy
 ```
 
 ## Features

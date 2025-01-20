@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="binance-data",
+    name="cached-binance-data",
     version="0.1.0",
-    packages=find_packages(include=['binance_data', 'binance_data.*']),
+    packages=find_packages(include=['cached_binance_data', 'cached_binance_data.*']),
     install_requires=[
         "pandas>=1.5.0",
         "numpy>=1.21.0",
@@ -21,7 +21,7 @@ setup(
     description="A Python module for downloading Binance futures market data with caching support",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/kunthet/binance-data",
+    url="https://github.com/kunthet/cached-binance-data",
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
