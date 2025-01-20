@@ -13,7 +13,7 @@ A Python module for downloading Binance futures market data with efficient cachi
 ## Installation
 
 ```bash
-pip install binance-futures-data
+pip install binance-data
 ```
 
 ## Quick Start
