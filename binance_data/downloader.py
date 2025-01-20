@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import requests
+import time
 from enum import Enum
 from .cache import DataCache
 from typing import Optional, Union, List, Tuple
@@ -46,11 +47,12 @@ class BinanceDataDownloader:
         TimeFrame.MONTH_1: 2592000
     }
     
-    def __init__(self, cache_dir: str = "hlocv_cache"):
+    def __init__(self, cache_dir: str = "hlocv_cache", requests_per_minute: int = 1200):
         """Initialize the downloader.
         
         Args:
             cache_dir (str): Directory for caching data
+            requests_per_minute (int): Maximum number of requests per minute (default: 1200)
         """
         self.session = requests.Session()
         self.session.headers.update({
@@ -58,6 +60,9 @@ class BinanceDataDownloader:
             'Accept': 'application/json',
         })
         self.cache = DataCache(cache_dir)
+        self.requests_per_minute = requests_per_minute
+        self.last_request_time = 0
+        self.min_request_interval = 60.0 / requests_per_minute  # Time in seconds between requests
     
     def validate_timeframe(self, timeframe: str) -> TimeFrame:
         """Validate and convert the timeframe string to TimeFrame enum.
@@ -147,6 +152,13 @@ class BinanceDataDownloader:
         Returns:
             np.ndarray: Downloaded data
         """
+        # Apply rate limiting
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last_request
+            time.sleep(sleep_time)
+        
         params = {
             'symbol': symbol.upper(),  # Ensure symbol is uppercase
             'interval': timeframe.value,
@@ -156,6 +168,7 @@ class BinanceDataDownloader:
         }
         
         response = self.session.get(f"{self.BASE_URL}/fapi/v1/klines", params=params)
+        self.last_request_time = time.time()  # Update last request time
         response.raise_for_status()
         
         klines = response.json()
