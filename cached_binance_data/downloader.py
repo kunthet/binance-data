@@ -1,11 +1,10 @@
 from datetime import datetime, timedelta
-import numpy as np
-import pandas as pd
+from enum import Enum
 import requests
 import time
-from enum import Enum
 from .cache import DataCache
 from typing import Optional, Union, List, Tuple
+import os
 
 class TimeFrame(str, Enum):
     """Supported timeframes for data download."""
@@ -24,6 +23,87 @@ class TimeFrame(str, Enum):
     DAY_3 = "3d"
     WEEK_1 = "1w"
     MONTH_1 = "1M"
+
+class DateHandler:
+    """Handles all date-related operations for data downloading."""
+    
+    @staticmethod
+    def normalize_datetime(dt: Union[str, datetime]) -> datetime:
+        """Convert string date to datetime or normalize existing datetime.
+        
+        Args:
+            dt: Date string or datetime object
+            
+        Returns:
+            Normalized datetime object
+        """
+        if isinstance(dt, str):
+            return datetime.strptime(dt, '%Y-%m-%d')
+        return dt
+    
+    @staticmethod
+    def align_to_daily_boundaries(dt: datetime) -> Tuple[datetime, datetime]:
+        """Align datetime to daily boundaries.
+        
+        Args:
+            dt: Datetime to align
+            
+        Returns:
+            Start and end of the day
+        """
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = (day_start + timedelta(days=1)) - timedelta(microseconds=1)
+        return day_start, day_end
+    
+    @staticmethod
+    def is_today(dt: datetime, current_time: datetime) -> bool:
+        """Check if datetime is from today.
+        
+        Args:
+            dt: Datetime to check
+            current_time: Current time for comparison
+            
+        Returns:
+            True if datetime is from today
+        """
+        today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        return dt >= today_start
+    
+    @staticmethod
+    def split_time_range(start_time: datetime, end_time: datetime) -> List[Tuple[datetime, datetime]]:
+        """Split time range into daily chunks.
+        
+        Args:
+            start_time: Start time
+            end_time: End time
+            
+        Returns:
+            List of (chunk_start, chunk_end) pairs
+        """
+        chunks = []
+        current_start = start_time
+        
+        # If start and end are on the same day, return a single chunk
+        if current_start.date() == end_time.date():
+            chunks.append((current_start, end_time))
+            return chunks
+        
+        # Handle first day (partial if not aligned)
+        if current_start.time() != datetime.min.time():
+            _, day_end = DateHandler.align_to_daily_boundaries(current_start)
+            chunks.append((current_start, day_end))
+            current_start = day_end + timedelta(microseconds=1)
+        
+        # Handle full days
+        while current_start < end_time:
+            day_start, day_end = DateHandler.align_to_daily_boundaries(current_start)
+            if day_end > end_time:
+                chunks.append((day_start, end_time))
+                break
+            chunks.append((day_start, day_end))
+            current_start = day_end + timedelta(microseconds=1)
+        
+        return chunks
 
 class BinanceDataDownloader:
     """Downloads and manages Binance futures market data."""
@@ -47,12 +127,17 @@ class BinanceDataDownloader:
         TimeFrame.MONTH_1: 2592000
     }
     
-    def __init__(self, cache_dir: str = "hlocv_cache", requests_per_minute: int = 1200):
+    def __init__(self, cache_dir: Optional[str] = None, 
+                 requests_per_minute: int = 1200,
+                 today_cache_expiry_minutes: int = 60):
         """Initialize the downloader.
         
         Args:
-            cache_dir (str): Directory for caching data
+            cache_dir (str, optional): Directory for caching data. If None, uses system's document folder.
             requests_per_minute (int): Maximum number of requests per minute (default: 1200)
+            today_cache_expiry_minutes (int): Cache expiration time in minutes for today's data.
+                                            Set to 0 to disable caching for today's data.
+                                            Default is 60 minutes.
         """
         self.session = requests.Session()
         self.session.headers.update({
@@ -63,6 +148,8 @@ class BinanceDataDownloader:
         self.requests_per_minute = requests_per_minute
         self.last_request_time = 0
         self.min_request_interval = 60.0 / requests_per_minute  # Time in seconds between requests
+        self.today_cache_expiry = timedelta(minutes=today_cache_expiry_minutes)
+        self.date_handler = DateHandler()
     
     def validate_timeframe(self, timeframe: str) -> TimeFrame:
         """Validate and convert the timeframe string to TimeFrame enum.
@@ -82,19 +169,6 @@ class BinanceDataDownloader:
             valid_options = [tf.value for tf in TimeFrame]
             raise ValueError(f"Invalid timeframe. Valid options are: {valid_options}")
     
-    def _align_to_daily_boundaries(self, dt: datetime) -> Tuple[datetime, datetime]:
-        """Align datetime to daily boundaries.
-        
-        Args:
-            dt (datetime): Datetime to align
-            
-        Returns:
-            Tuple[datetime, datetime]: Start and end of the day
-        """
-        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = (day_start + timedelta(days=1)) - timedelta(microseconds=1)
-        return day_start, day_end
-    
     def _get_records_per_day(self, timeframe: TimeFrame) -> int:
         """Calculate number of records per day for a given timeframe.
         
@@ -106,6 +180,19 @@ class BinanceDataDownloader:
         """
         seconds_per_day = 24 * 60 * 60
         return seconds_per_day // self.VALID_TIMEFRAMES[timeframe]
+    
+    def _align_to_daily_boundaries(self, dt: datetime) -> tuple[datetime, datetime]:
+        """Align datetime to daily boundaries.
+        
+        Args:
+            dt (datetime): Datetime to align
+            
+        Returns:
+            tuple[datetime, datetime]: Start and end of the day
+        """
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = (day_start + timedelta(days=1)) - timedelta(microseconds=1)
+        return day_start, day_end
     
     def _split_time_range(self, start_time: datetime, end_time: datetime, 
                          timeframe: TimeFrame) -> List[Tuple[datetime, datetime]]:
@@ -124,13 +211,13 @@ class BinanceDataDownloader:
         
         # Handle first day (partial if not aligned)
         if current_start.time() != datetime.min.time():
-            _, day_end = self._align_to_daily_boundaries(current_start)
+            _, day_end = self.date_handler.align_to_daily_boundaries(current_start)
             chunks.append((current_start, day_end))
             current_start = day_end + timedelta(microseconds=1)
         
         # Handle full days
         while current_start < end_time:
-            day_start, day_end = self._align_to_daily_boundaries(current_start)
+            day_start, day_end = self.date_handler.align_to_daily_boundaries(current_start)
             if day_end > end_time:
                 chunks.append((day_start, end_time))
                 break
@@ -140,7 +227,7 @@ class BinanceDataDownloader:
         return chunks
     
     def _download_chunk(self, symbol: str, timeframe: TimeFrame, 
-                       start_time: datetime, end_time: datetime) -> np.ndarray:
+                       start_time: datetime, end_time: datetime) -> list:
         """Download a single chunk of data from Binance.
         
         Args:
@@ -150,7 +237,7 @@ class BinanceDataDownloader:
             end_time (datetime): Chunk end time
             
         Returns:
-            np.ndarray: Downloaded data
+            list: List of lists containing [timestamp, high, low, open, close, volume]
         """
         # Apply rate limiting
         current_time = time.time()
@@ -174,15 +261,16 @@ class BinanceDataDownloader:
         klines = response.json()
         
         if not klines:
-            return np.array([])
+            return []
         
         valid_data = []
         for k in klines:
             try:
                 if len(k) < 6:  # Need at least 6 elements for OHLCV data
                     continue
+                # Binance kline format: [open_time, open, high, low, close, volume, ...]
                 valid_data.append([
-                    float(k[0]),  # timestamp
+                    float(k[0]),  # timestamp (open_time)
                     float(k[2]),  # high
                     float(k[3]),  # low
                     float(k[1]),  # open
@@ -192,93 +280,205 @@ class BinanceDataDownloader:
             except (IndexError, ValueError, TypeError):
                 continue  # Skip invalid entries
         
-        if not valid_data:
-            return np.array([])
+        return valid_data
+    
+    def _filter_unique_data(self, data: List[List[float]], start_time: datetime, end_time: datetime) -> List[List[float]]:
+        """Filter data to include only unique timestamps within the specified time range.
+        
+        Args:
+            data: List of OHLCV data points
+            start_time: Start of the time range
+            end_time: End of the time range
             
-        return np.array(valid_data)
+        Returns:
+            List of unique data points within the time range
+        """
+        # Convert datetime to millisecond timestamps for comparison
+        start_ts = int(start_time.timestamp() * 1000)
+        end_ts = int(end_time.timestamp() * 1000)
+        
+        # Sort by timestamp and remove duplicates while filtering time range
+        data.sort(key=lambda x: x[0])
+        seen_timestamps = set()
+        unique_data = []
+        
+        for row in data:
+            # Convert timestamp to integer for consistent comparison
+            timestamp = int(float(row[0]))
+            
+            # Check if timestamp is within range and not seen before
+            if timestamp not in seen_timestamps and start_ts <= timestamp <= end_ts:
+                seen_timestamps.add(timestamp)
+                unique_data.append(row)
+        
+        return sorted(unique_data, key=lambda x: x[0])  # Ensure sorted output
+    
+    def _ensure_interval_spacing(self, data: List[List[float]], interval_seconds: int) -> List[List[float]]:
+        """Ensure proper interval spacing between data points, forward-filling missing values.
+        
+        Args:
+            data: List of OHLCV data points
+            interval_seconds: Expected interval between points in seconds
+            
+        Returns:
+            List of data points with proper interval spacing
+        """
+        if not data:
+            return []
+            
+        interval_ms = interval_seconds * 1000
+        expected_data = []
+        
+        # Align timestamps to interval boundaries
+        first_ts = int(float(data[0][0]))
+        last_ts = int(float(data[-1][0]))
+        
+        # Calculate the number of intervals needed
+        num_intervals = (last_ts - first_ts) // interval_ms
+        if (last_ts - first_ts) % interval_ms > 0:
+            num_intervals += 1
+        
+        # Generate timestamps for each interval
+        i = 0  # Index in data array
+        for interval in range(int(num_intervals + 1)):
+            current_ts = first_ts + (interval * interval_ms)
+            
+            # Find if we have a data point for this interval
+            while i < len(data) and int(float(data[i][0])) < current_ts:
+                i += 1
+                
+            if i < len(data) and abs(int(float(data[i][0])) - current_ts) < interval_ms:
+                # Use actual data point
+                expected_data.append(data[i])
+                i += 1
+            else:
+                # Forward fill from previous point
+                prev_point = list(data[i-1] if i > 0 else data[0])
+                prev_point[0] = float(current_ts)
+                expected_data.append(prev_point)
+        
+        return expected_data
+    
+    def _should_use_cache(self, chunk_start: datetime, current_time: datetime, force_refresh: bool) -> bool:
+        """Determine if cache should be used for the given chunk.
+        
+        Args:
+            chunk_start: Start time of the chunk
+            current_time: Current time
+            force_refresh: Whether to force refresh data
+            
+        Returns:
+            bool: True if cache should be used, False otherwise
+        """
+        is_today = self.date_handler.is_today(chunk_start, current_time)
+        return not (force_refresh or (is_today and self.today_cache_expiry.total_seconds() == 0))
+    
+    def _is_cache_expired(self, cache_file: str, current_time: datetime, is_today: bool) -> bool:
+        """Check if cache is expired for today's data.
+        
+        Args:
+            cache_file: Path to cache file
+            current_time: Current time
+            is_today: Whether the data is from today
+            
+        Returns:
+            bool: True if cache is expired, False otherwise
+        """
+        if not is_today:
+            return False
+        cache_mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        return current_time - cache_mtime > self.today_cache_expiry
+    
+    def _process_chunk(self, symbol: str, timeframe: str, timeframe_enum: TimeFrame,
+                      chunk_start: datetime, chunk_end: datetime, 
+                      current_time: datetime, force_refresh: bool) -> List[List[float]]:
+        """Process a single chunk of data, handling cache and download logic.
+        
+        Args:
+            symbol: Trading pair symbol
+            timeframe: Time interval string
+            timeframe_enum: TimeFrame enum
+            chunk_start: Start time of chunk
+            chunk_end: End time of chunk
+            current_time: Current time
+            force_refresh: Whether to force refresh data
+            
+        Returns:
+            List of OHLCV data points
+        """
+        if self._should_use_cache(chunk_start, current_time, force_refresh):
+            cached_data = self.cache.load_from_cache(symbol, timeframe, chunk_start, chunk_end)
+            if cached_data is not None:
+                is_today = self.date_handler.is_today(chunk_start, current_time)
+                cache_file = self.cache.get_cache_filename(symbol, timeframe, chunk_start, chunk_end)
+                if not self._is_cache_expired(cache_file, current_time, is_today):
+                    return cached_data
+
+        # Download and cache if needed
+        chunk_data = self._download_chunk(symbol, timeframe_enum, chunk_start, chunk_end)
+        if chunk_data and self._should_use_cache(chunk_start, current_time, force_refresh):
+            self.cache.save_to_cache(chunk_data, symbol, timeframe, chunk_start, chunk_end)
+        return chunk_data or []
     
     def download(self, symbol: str, timeframe: str, 
                 start_time: Union[str, datetime], 
-                end_time: Union[str, datetime]) -> pd.DataFrame:
-        """Download Binance futures data for the specified period.
+                end_time: Union[str, datetime],
+                force_refresh: bool = False) -> List[List[float]]:
+        """Download market data for the specified symbol and timeframe.
         
         Args:
-            symbol (str): Trading pair symbol (e.g., 'BTCUSDT')
-            timeframe (str): Data timeframe (e.g., '1m', '1h')
-            start_time (Union[str, datetime]): Start time (string format: 'YYYY-MM-DD' or datetime)
-            end_time (Union[str, datetime]): End time (string format: 'YYYY-MM-DD' or datetime)
+            symbol: Trading pair symbol (e.g., "BTCUSDT")
+            timeframe: Time interval (e.g., "1m", "1h", "1d")
+            start_time: Start time for data download
+            end_time: End time for data download
+            force_refresh: If True, ignore cache and force download fresh data
             
         Returns:
-            pd.DataFrame: Downloaded data with columns [timestamp, high, low, open, close, volume]
+            List of OHLCV data points
         """
         timeframe_enum = self.validate_timeframe(timeframe)
         
-        # Convert string dates to datetime if necessary
-        if isinstance(start_time, str):
-            start_time = datetime.strptime(start_time, '%Y-%m-%d')
-        if isinstance(end_time, str):
-            end_time = datetime.strptime(end_time, '%Y-%m-%d')
-            
+        # Normalize dates
+        start_time = self.date_handler.normalize_datetime(start_time)
+        end_time = self.date_handler.normalize_datetime(end_time)
+        
         # If end_time is just a date, set it to end of day
         if end_time.hour == 0 and end_time.minute == 0 and end_time.second == 0:
             end_time = end_time.replace(hour=23, minute=59, second=59, microsecond=999999)
         
-        # Return empty DataFrame for future dates
-        current_time = datetime.now()
-        if start_time > current_time:
-            return pd.DataFrame(columns=['timestamp', 'high', 'low', 'open', 'close', 'volume'])
+        # Return empty list for future dates - do this check first
+        current_time = datetime.now().replace(microsecond=0)  # Remove microseconds for stable comparison
+        if start_time >= current_time:
+            return []
         
-        # Adjust end_time if it's in the future
+        # Adjust end_time if it's in the future and validate time range
         if end_time > current_time:
             end_time = current_time
+        
+        if end_time <= start_time:
+            return []
         
         chunks = self._split_time_range(start_time, end_time, timeframe_enum)
         all_data = []
         
         for chunk_start, chunk_end in chunks:
-            # Try to load from cache first
-            cached_data = self.cache.load_from_cache(symbol, timeframe, chunk_start, chunk_end)
-            
-            if cached_data is not None and len(cached_data) > 0:
-                all_data.append(cached_data)
-            else:
-                # Download and cache if not found
-                chunk_data = self._download_chunk(symbol, timeframe_enum, chunk_start, chunk_end)
-                if len(chunk_data) > 0:
-                    self.cache.save_to_cache(chunk_data, symbol, timeframe, chunk_start, chunk_end)
-                    all_data.append(chunk_data)
+            chunk_data = self._process_chunk(
+                symbol, timeframe, timeframe_enum,
+                chunk_start, chunk_end, current_time, force_refresh
+            )
+            all_data.extend(chunk_data)
         
         if not all_data:
-            return pd.DataFrame(columns=['timestamp', 'high', 'low', 'open', 'close', 'volume'])
+            return []
         
-        # Combine all chunks and convert to DataFrame
-        combined_data = np.concatenate(all_data)
-        df = pd.DataFrame(
-            combined_data,
-            columns=['timestamp', 'high', 'low', 'open', 'close', 'volume']
-        )
+        # Filter unique data points within time range
+        unique_data = self._filter_unique_data(all_data, start_time, end_time)
         
-        # Convert timestamp to datetime and filter to requested range
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df[
-            (df['timestamp'] >= pd.Timestamp(start_time)) & 
-            (df['timestamp'] <= pd.Timestamp(end_time))
-        ]
-        
-        # Sort by timestamp and remove duplicates
-        df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='first')
-        
-        # For timeframes larger than 1 minute, ensure proper interval spacing
-        if timeframe_enum != TimeFrame.MINUTE_1:
-            interval_seconds = self.VALID_TIMEFRAMES[timeframe_enum]
-            expected_timestamps = pd.date_range(
-                start=df['timestamp'].min(),
-                end=df['timestamp'].max(),
-                freq=f"{interval_seconds}s"
+        # Ensure proper interval spacing for timeframes larger than 1 minute
+        if timeframe_enum != TimeFrame.MINUTE_1 and unique_data:
+            unique_data = self._ensure_interval_spacing(
+                unique_data, 
+                self.VALID_TIMEFRAMES[timeframe_enum]
             )
-            df = df.set_index('timestamp').reindex(expected_timestamps).reset_index()
-            df = df.rename(columns={'index': 'timestamp'})
-            # Forward fill missing values
-            df = df.ffill()
         
-        return df.reset_index(drop=True) 
+        return unique_data 
